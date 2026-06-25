@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars and fill in your values
+aws_region          = "us-east-2"
+paper_version       = "1.21.1"
+paper_build         = "latest"
+instance_type       = "t4g.small"
+allowed_ssh_cidr    = "YOUR_IP/32"        # e.g. "203.0.113.10/32"
+ssh_public_key_path = "~/.ssh/minecraft.pub"
+world_volume_size_gb = 20
+idle_minutes        = 60
+
+# Set to true ONLY when you intend to tear everything down (lets terraform destroy
+# delete the S3 backup bucket and all objects/versions). Leave false otherwise.
+allow_destroy       = false

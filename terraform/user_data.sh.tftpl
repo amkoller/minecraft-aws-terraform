@@ -1,0 +1,221 @@
+#!/bin/bash
+set -euo pipefail
+exec > >(tee /var/log/user-data.log | logger -t user-data) 2>&1
+
+# --- System packages ---
+dnf -y update
+dnf -y install java-25-amazon-corretto-headless tmux jq unzip rsync awscli cronie gcc make git
+
+systemctl enable --now crond
+
+# --- minecraft system user ---
+useradd -r -m -d /opt/minecraft -s /sbin/nologin minecraft
+
+# --- Mount world volume ---
+echo "Waiting for /dev/nvme1n1..."
+for i in $(seq 1 60); do
+  [ -b /dev/nvme1n1 ] && break
+  sleep 1
+done
+[ -b /dev/nvme1n1 ] || { echo "ERROR: /dev/nvme1n1 not found after 60s"; exit 1; }
+
+if ! blkid /dev/nvme1n1 | grep -q xfs; then
+  mkfs.xfs /dev/nvme1n1
+fi
+
+UUID=$(blkid -s UUID -o value /dev/nvme1n1)
+mkdir -p /opt/minecraft/server
+
+grep -q "$UUID" /etc/fstab || \
+  echo "UUID=$UUID /opt/minecraft/server xfs defaults,nofail 0 2" >> /etc/fstab
+
+mount -a
+
+chown -R minecraft:minecraft /opt/minecraft
+
+# --- PaperMC download ---
+mkdir -p /opt/minecraft/server
+cd /opt/minecraft/server
+
+PAPER_VERSION="${paper_version}"
+PAPER_BUILD="${paper_build}"
+
+BUILDS_JSON=$(curl -fsSL "https://fill.papermc.io/v3/projects/paper/versions/$PAPER_VERSION/builds")
+
+if [ "$PAPER_BUILD" = "latest" ]; then
+  PAPER_URL=$(echo "$BUILDS_JSON" | jq -r '.[0].downloads["server:default"].url')
+else
+  PAPER_URL=$(echo "$BUILDS_JSON" | jq -r --argjson b "$PAPER_BUILD" '.[] | select(.id == $b) | .downloads["server:default"].url')
+fi
+
+[ -n "$PAPER_URL" ] && [ "$PAPER_URL" != "null" ] || { echo "ERROR: no Paper build found for $PAPER_VERSION/$PAPER_BUILD"; exit 1; }
+
+curl -fsSL "$PAPER_URL" -o /opt/minecraft/server/paper.jar
+
+# --- Seed initial configs ---
+mkdir -p /etc/minecraft
+
+cat > /etc/minecraft/rcon.env <<'RCONEOF'
+RCON_HOST=127.0.0.1
+RCON_PORT=25575
+RCON_PASSWORD=${rcon_password}
+RCONEOF
+chmod 600 /etc/minecraft/rcon.env
+
+cat > /opt/minecraft/server/eula.txt <<'EOF'
+eula=true
+EOF
+
+cat > /opt/minecraft/server/server.properties <<SPROPS
+enable-rcon=true
+rcon.port=25575
+rcon.bind=127.0.0.1
+rcon.password=${rcon_password}
+broadcast-rcon-to-ops=false
+server-port=25565
+SPROPS
+
+# --- mcrcon ---
+cd /tmp
+git clone https://github.com/Tiiffi/mcrcon.git
+cd mcrcon
+gcc -std=gnu11 -o mcrcon mcrcon.c
+install -m 755 mcrcon /usr/local/bin/mcrcon
+cd /
+
+# --- Scripts ---
+cat > /usr/local/sbin/autostop.sh <<'AUTOSTOP'
+#!/bin/bash
+set -euo pipefail
+
+# cron runs with a minimal PATH (/usr/bin:/bin). mcrcon is installed in
+# /usr/local/bin, so without this the "list" query silently fails, COUNT comes
+# back empty, and the script bails before ever counting idle time — the server
+# then runs 24/7. Set an explicit PATH so cron behaves like a login shell.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
+
+source /etc/minecraft/rcon.env
+
+if [ "$(systemctl is-active minecraft)" != "active" ]; then
+  exit 0
+fi
+
+if ! command -v mcrcon >/dev/null 2>&1; then
+  echo "$(date -u) ERROR: mcrcon not found on PATH ($PATH) — cannot check players"
+  exit 1
+fi
+
+RAW=$(mcrcon -H "$RCON_HOST" -P "$RCON_PORT" -p "$RCON_PASSWORD" "list" 2>/dev/null || true)
+OUT=$(echo "$RAW" | sed -E 's/\x1B\[[0-9;]*[mGKHF]//g')
+
+COUNT=$(echo "$OUT" | grep -oP 'There are \K\d+' | head -1)
+if [ -z "$COUNT" ]; then
+  echo "$(date -u) WARN: could not parse player list, skipping. Raw: $(echo "$RAW" | tr -d '\n' | head -c 200)"
+  exit 0
+fi
+IDLE_FILE=/var/lib/minecraft/idle_ticks
+THRESHOLD=$(( ${idle_minutes} / 5 ))
+
+if [ "$COUNT" -gt 0 ]; then
+  echo 0 > "$IDLE_FILE"
+  echo "$(date -u) Players online: $COUNT — resetting idle counter"
+  exit 0
+fi
+
+TICKS=0
+[ -f "$IDLE_FILE" ] && TICKS=$(cat "$IDLE_FILE")
+TICKS=$(( TICKS + 1 ))
+echo "$TICKS" > "$IDLE_FILE"
+echo "$(date -u) No players. Idle ticks: $TICKS / $THRESHOLD"
+
+if [ "$TICKS" -ge "$THRESHOLD" ]; then
+  echo "$(date -u) Idle threshold reached — shutting down"
+  mcrcon -H "$RCON_HOST" -P "$RCON_PORT" -p "$RCON_PASSWORD" \
+    "say Server idle, shutting down in 30 seconds." || true
+  sleep 30
+  mcrcon -H "$RCON_HOST" -P "$RCON_PORT" -p "$RCON_PASSWORD" "stop" || true
+  sleep 10
+  /sbin/shutdown -h now
+fi
+AUTOSTOP
+chmod 750 /usr/local/sbin/autostop.sh
+
+cat > /usr/local/sbin/backup.sh <<'BACKUP'
+#!/bin/bash
+set -euo pipefail
+source /etc/minecraft/rcon.env
+S3_BUCKET="${s3_bucket}"
+REGION="${aws_region}"
+
+SAVE_ON_NEEDED=0
+
+if [ "$(systemctl is-active minecraft)" = "active" ]; then
+  SAVE_ON_NEEDED=1
+  trap 'mcrcon -H "$RCON_HOST" -P "$RCON_PORT" -p "$RCON_PASSWORD" "save-on" || true' EXIT
+  mcrcon -H "$RCON_HOST" -P "$RCON_PORT" -p "$RCON_PASSWORD" "save-all flush"
+  sleep 3
+  mcrcon -H "$RCON_HOST" -P "$RCON_PORT" -p "$RCON_PASSWORD" "save-off"
+fi
+
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+BASE=/opt/minecraft/server
+
+for WORLD in world world_nether world_the_end; do
+  if [ -d "$BASE/$WORLD" ]; then
+    aws s3 sync "$BASE/$WORLD/" "s3://$S3_BUCKET/world/$TS/$WORLD/" \
+      --only-show-errors --region "$REGION"
+  fi
+done
+
+echo "$(date -u) Backup $TS complete"
+BACKUP
+chmod 750 /usr/local/sbin/backup.sh
+
+# --- systemd unit ---
+cat > /etc/systemd/system/minecraft.service <<'UNIT'
+[Unit]
+Description=PaperMC Minecraft Server
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/opt/minecraft/server
+
+[Service]
+Type=simple
+User=minecraft
+Group=minecraft
+WorkingDirectory=/opt/minecraft/server
+EnvironmentFile=/etc/minecraft/rcon.env
+ExecStart=/usr/lib/jvm/java-25-amazon-corretto.aarch64/bin/java -Xms2G -Xmx3G -XX:+UseG1GC -jar paper.jar --nogui
+ExecStop=/usr/local/bin/mcrcon -H $${RCON_HOST} -P $${RCON_PORT} -p $${RCON_PASSWORD} stop
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=15
+SuccessExitStatus=0 143
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# --- cron ---
+cat > /etc/cron.d/minecraft <<'CRON'
+PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
+*/5 * * * * root /usr/local/sbin/autostop.sh >> /var/log/minecraft-autostop.log 2>&1
+30 4 * * * root /usr/local/sbin/backup.sh >> /var/log/minecraft-backup.log 2>&1
+CRON
+
+# --- State directory ---
+mkdir -p /var/lib/minecraft
+chown minecraft:minecraft /var/lib/minecraft
+
+# --- Ownership + start ---
+chown -R minecraft:minecraft /opt/minecraft
+
+systemctl daemon-reload
+systemctl enable --now minecraft
+
+touch /var/lib/minecraft/provisioned
+echo "$(date -u) Provisioning complete"

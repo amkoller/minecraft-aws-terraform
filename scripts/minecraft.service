@@ -1,0 +1,25 @@
+[Unit]
+Description=PaperMC Minecraft Server
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/opt/minecraft/server/world
+
+[Service]
+Type=simple
+User=minecraft
+Group=minecraft
+WorkingDirectory=/opt/minecraft/server
+EnvironmentFile=/etc/minecraft/rcon.env
+ExecStart=/usr/bin/java -Xms2G -Xmx3G -XX:+UseG1GC -jar paper.jar --nogui
+ExecStop=/usr/local/bin/mcrcon -H ${RCON_HOST} -P ${RCON_PORT} -p ${RCON_PASSWORD} stop
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=15
+SuccessExitStatus=0 143
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

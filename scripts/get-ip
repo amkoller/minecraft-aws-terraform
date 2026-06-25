@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TERRAFORM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../terraform" && pwd)"
+
+INSTANCE_ID=$(terraform -chdir="$TERRAFORM_DIR" output -raw instance_id)
+REGION=$(terraform -chdir="$TERRAFORM_DIR" output -raw region)
+
+aws ec2 describe-instances \
+  --instance-ids "$INSTANCE_ID" \
+  --region "$REGION" \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' \
+  --output text
