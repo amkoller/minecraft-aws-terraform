@@ -1,6 +1,11 @@
 output "instance_id" {
-  description = "EC2 instance ID"
-  value       = aws_instance.minecraft.id
+  description = "EC2 instance ID (null while hibernated)"
+  value       = one(aws_instance.minecraft[*].id)
+}
+
+output "world_volume_id" {
+  description = "World EBS volume ID (null while hibernated)"
+  value       = one(aws_ebs_volume.world[*].id)
 }
 
 output "s3_backup_bucket" {

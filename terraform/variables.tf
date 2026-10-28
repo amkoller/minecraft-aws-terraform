@@ -52,7 +52,19 @@ variable "root_volume_size_gb" {
 }
 
 variable "allow_destroy" {
-  description = "Set to true to allow terraform destroy to empty + delete the S3 backup bucket (including all object versions). Default false is the safety net. NOTE: the world EBS volume's prevent_destroy lifecycle block must still be removed manually — Terraform does not allow gating prevent_destroy on a variable."
+  description = "Set to true to allow terraform destroy to empty + delete the S3 backup bucket (including all object versions). Default false is the safety net. "
   type        = bool
   default     = false
+}
+
+variable "server_enabled" {
+  description = "Whether the instance and world volume exist. Managed by ./mc hibernate and ./mc wake via hibernate.auto.tfvars."
+  type        = bool
+  default     = true
+}
+
+variable "world_snapshot_id" {
+  description = "EBS snapshot to create the world volume from. Managed by ./mc hibernate and ./mc wake via hibernate.auto.tfvars."
+  type        = string
+  default     = null
 }

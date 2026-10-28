@@ -20,6 +20,8 @@ locals {
 }
 
 resource "aws_instance" "minecraft" {
+  count = var.server_enabled ? 1 : 0
+
   ami                         = data.aws_ami.al2023_arm.id
   instance_type               = var.instance_type
   key_name                    = aws_key_pair.minecraft.key_name
@@ -47,12 +49,25 @@ resource "aws_instance" "minecraft" {
   }
 
   lifecycle {
-    ignore_changes = [ami]
+    # A stopped instance reports no public IP, which would otherwise force replacement.
+    ignore_changes = [ami, associate_public_ip_address]
   }
 }
 
 resource "aws_volume_attachment" "world" {
+  count = var.server_enabled ? 1 : 0
+
   device_name = "/dev/sdf"
-  volume_id   = aws_ebs_volume.world.id
-  instance_id = aws_instance.minecraft.id
+  volume_id   = aws_ebs_volume.world[0].id
+  instance_id = aws_instance.minecraft[0].id
+}
+
+moved {
+  from = aws_instance.minecraft
+  to   = aws_instance.minecraft[0]
+}
+
+moved {
+  from = aws_volume_attachment.world
+  to   = aws_volume_attachment.world[0]
 }

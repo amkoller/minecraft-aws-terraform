@@ -4,6 +4,7 @@
 *.tfstate.lock.info
 .terraform.lock.hcl
 terraform.tfvars
+*.auto.tfvars
 *.pem
 .DS_Store
 /tmp/

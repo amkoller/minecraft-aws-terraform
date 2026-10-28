@@ -1,15 +1,25 @@
+# No prevent_destroy: `./mc hibernate` destroys this volume after snapshotting it.
 resource "aws_ebs_volume" "world" {
+  count = var.server_enabled ? 1 : 0
+
   availability_zone = data.aws_subnet.primary.availability_zone
   size              = var.world_volume_size_gb
   type              = "gp3"
+  snapshot_id       = var.world_snapshot_id
 
   tags = {
     Name = "minecraft-world"
   }
 
   lifecycle {
-    prevent_destroy = true
+    # snapshot_id only matters at creation; changing it must not replace a live volume.
+    ignore_changes = [snapshot_id]
   }
+}
+
+moved {
+  from = aws_ebs_volume.world
+  to   = aws_ebs_volume.world[0]
 }
 
 resource "aws_s3_bucket" "backups" {

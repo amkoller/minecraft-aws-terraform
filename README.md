@@ -37,6 +37,8 @@ cd ..
 ./mc backup-now   # run nightly backup script on demand
 ./mc restore <ts> # restore world from S3 timestamp
 ./mc rcon <cmd>   # arbitrary RCON command
+./mc hibernate    # snapshot world → destroy instance + volumes (long-term parking)
+./mc wake         # recreate server from the hibernate snapshot (~10 min)
 ```
 
 Server auto-stops 60 minutes after the last player leaves (on-box cron every 5 min).
@@ -61,6 +63,26 @@ aws s3 ls s3://$(terraform -chdir=terraform output -raw s3_backup_bucket)/world/
 ./mc restore 20240101T043000Z            # pick a timestamp from the listing
 ```
 
+## Hibernate (long-term parking)
+
+A stopped instance still bills ~$2.24/mo for its two EBS volumes. Hibernate removes them.
+
+`./mc hibernate` stops the server, snapshots the world volume, and waits for the snapshot to complete. It then runs `terraform apply` to destroy the instance, root volume, and world volume. The snapshot ID and `server_enabled = false` go into `terraform/hibernate.auto.tfvars`, which Terraform loads automatically. The security group, key pair, IAM role, and S3 bucket stay, and none of them cost anything.
+
+`./mc wake` sets `server_enabled = true` and runs `terraform apply`. Terraform builds a fresh instance and a world volume from the snapshot. The script waits for provisioning, runs `./mc deploy`, and prints the connect address. The first world load runs slower, because EBS fetches snapshot blocks on first read.
+
+Both commands pass extra arguments to `terraform apply`. Use `./mc wake -auto-approve` where no keyboard is attached, such as Claude Code's `!` prefix.
+
+Check `allowed_ssh_cidr` in `terraform.tfvars` before waking. `wake` needs SSH to deploy config, and prints your current IP for comparison.
+
+Hibernate snapshots stay until deleted by hand. List them with:
+
+```bash
+aws ec2 describe-snapshots --owner-ids self --region us-east-2 \
+  --filters Name=tag:Name,Values=minecraft-world-hibernate \
+  --query 'Snapshots[].[SnapshotId,StartTime,Description]' --output table
+```
+
 ## Cost
 
 | Usage | ~$/mo |
@@ -70,6 +92,7 @@ aws s3 ls s3://$(terraform -chdir=terraform output -raw s3_backup_bucket)/world/
 | 2 hr/day play | ~$3.90 |
 | 4 hr/day play | ~$5.25 |
 | 24/7 (no auto-stop) | ~$18.35 |
+| Hibernated (snapshot only) | ~$0.05 per GB of world data |
 
 ## Troubleshooting
 
@@ -90,9 +113,10 @@ aws s3 ls s3://$(terraform -chdir=terraform output -raw s3_backup_bucket)/world/
 
 ## Destroying
 
-To tear down (will prompt due to `prevent_destroy` on world EBS):
+To tear everything down permanently, run `./mc hibernate` first if you want to keep the world. Then:
 
 ```bash
-# First manually remove prevent_destroy from terraform/storage.tf if intentional
-cd terraform && terraform destroy
+cd terraform && terraform destroy   # set allow_destroy = true to also delete the S3 bucket
 ```
+
+The world volume no longer has `prevent_destroy`, because `./mc hibernate` must destroy it. `terraform destroy` will delete the world volume without an extra prompt.
