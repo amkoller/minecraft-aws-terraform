@@ -8,3 +8,4 @@ terraform.tfvars
 *.pem
 .DS_Store
 /tmp/
+docs/
